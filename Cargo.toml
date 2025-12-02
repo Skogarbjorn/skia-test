@@ -1,0 +1,11 @@
+[package]
+name = "skia-test"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+winit = "0.30.12" # Or your preferred version
+softbuffer = "0.4" # A buffer to draw to a winit window
+tiny-skia = "0.11" # A simple 2D drawing library (Skia-like)
+skia-safe = { version = "0.90.0", features = ["wpgu"] }
+wgpu = "27.0.1"
