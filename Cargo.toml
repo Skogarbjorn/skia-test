@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-winit = "0.30.12" # Or your preferred version
-softbuffer = "0.4" # A buffer to draw to a winit window
-tiny-skia = "0.11" # A simple 2D drawing library (Skia-like)
-skia-safe = { version = "0.90.0", features = ["wpgu"] }
-wgpu = "27.0.1"
+winit = "0.30.12"
+skia-safe = { version = "0.90.0", features = ["gl"] }
+pollster = "0.4.0"
+glutin = "0.32.3"
+glutin-winit = "0.5.0"
+gl = "0.14.0"

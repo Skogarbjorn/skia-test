@@ -1,0 +1,297 @@
+mod main_1;
+
+use skia_safe::gpu::vk::{BackendContext, GetProc};
+use skia_safe::gpu::DirectContext;
+use wgpu::wgt::DeviceDescriptor;
+use wgpu::{self, Adapter, Device, DeviceDescriptor, Instance, InstanceDescriptor, RequestAdapterOptions, Surface, SurfaceConfiguration};
+
+use winit::dpi::{LogicalPosition, PhysicalSize};
+use winit::error::EventLoopError;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::window::{Window, WindowAttributes, WindowId};
+
+use skia_safe::ColorType;
+
+use std::num::NonZeroU32;
+use std::rc::Rc;
+
+struct Button {
+    //rect: Rect,
+    is_hovered: bool,
+    is_pressed: bool,
+}
+
+struct GpuState {
+    instance: wgpu::Instance,
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    skia_context: skia_safe::gpu::DirectContext,
+    skia_surface: skia_safe::Surface,
+}
+
+struct App {
+    window: Option<Rc<Window>>,
+    gpu_state: Option<GpuState>,
+    button: Button,
+}
+
+impl winit::application::ApplicationHandler<()> for App {
+    // 1. On platforms without a formal lifecycle, the window should be created 
+    // immediately in `main` or here if the platform requires it, but in our 
+    // case, we create it in main for desktop platforms for simplicity.
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // This is primarily for Android/iOS, but can be a fallback.
+        if self.window.is_none() {
+            // For desktop, this logic should generally be in main.
+            // On non-desktop, this is the correct place.
+            let attrs = WindowAttributes::default().with_title("gamer");
+            match event_loop.create_window(attrs) {
+                Ok(window) => {
+                    /*
+                    let rc_window = Rc::new(window);
+                    
+                    // Initialize softbuffer context and surface
+                    let context = Context::new(rc_window.clone()).unwrap();
+                    let surface = Surface::new(&context, rc_window.clone()).unwrap();
+                    let context = 
+
+                    self.context = Some(context);
+                    self.window = Some(rc_window);
+                    self.window_state = Some(WindowState { surface });
+                    
+                    self.window.as_ref().unwrap().request_redraw();
+                    */
+                },
+                Err(e) => eprintln!("Failed to create window: {:?}", e),
+            }
+        }
+    }
+    
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+
+        if window_id != window.id() {
+            return;
+        }
+
+        match event {
+            WindowEvent::CloseRequested => {
+                println!("it was closed");
+                // The event loop will exit naturally if all windows are dropped 
+                // in the `ApplicationHandler` implementation. For a single-window
+                // app, simply dropping the window will exit.
+                //
+                //self.window = None;
+                //self.window_state = None;
+                //self.context = None;
+                event_loop.exit();
+            }
+            WindowEvent::CursorMoved { device_id, position } => {
+                /*
+                let physical_pos: LogicalPosition<f32> = position.to_logical(window.scale_factor());
+                //let x = physical_pos.x as f32;
+                //let y = physical_pos.y as f32;
+                let x = position.x as f32;
+                let y = position.y as f32;
+
+                let was_hovered = self.button.is_hovered;
+                self.button.is_hovered = {
+                    let rect = self.button.rect;
+                    x >= rect.left() && x <= rect.right() && y >= rect.top() && y <= rect.bottom()
+                };
+
+                if was_hovered != self.button.is_hovered {
+                    window.request_redraw();
+                }
+                */
+            }
+            WindowEvent::RedrawRequested => {
+                if let Some(state) = &mut self.window_state {
+                    let size = window.inner_size();
+                    let width = NonZeroU32::new(size.width).unwrap_or(NonZeroU32::new(1).unwrap());
+                    let height = NonZeroU32::new(size.height).unwrap_or(NonZeroU32::new(1).unwrap());
+
+                    // Resize the surface if necessary
+                    state.surface.resize(width, height).unwrap();
+                    
+                    // Get the buffer to draw to
+                    let mut buffer = state.surface.buffer_mut().unwrap();
+
+                    // --- Drawing with tiny-skia (The "White Box" logic) ---
+                    let mut pixmap = tiny_skia::Pixmap::new(width.get(), height.get()).unwrap();
+                    
+                    // Fill the entire pixmap with a background color (e.g., black)
+                    pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
+                    
+                    // Define a white paint
+                    let mut paint = Paint::default();
+                    paint.set_color_rgba8(255, 255, 255, 255); // White color
+                    
+                    // Create a path for a rectangle (e.g., 100x100 box in the center)
+                    let rect_width = 100.0;
+                    let rect_height = 100.0;
+                    let x = (width.get() as f32 - rect_width) / 2.0;
+                    let y = (height.get() as f32 - rect_height) / 2.0;
+                    
+                    let rect_path = PathBuilder::from_rect(
+                        tiny_skia::Rect::from_xywh(x, y, rect_width, rect_height).unwrap(),
+                    );
+                    
+                    let mut stroke = Stroke::default();
+
+                    // Draw the white box
+                    pixmap.fill_path(
+                        &rect_path.stroke(&stroke, 32.0).unwrap(),
+                        &paint,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+
+                    let button_rect = self.button.rect;
+                    let mut button_paint = Paint::default();
+                    if self.button.is_pressed {
+                        button_paint.set_color_rgba8(50, 50, 50, 100);
+                    } else if self.button.is_hovered {
+                        button_paint.set_color_rgba8(100, 100, 100, 100);
+                    } else {
+                        button_paint.set_color_rgba8(255, 255, 255, 100);
+                    }
+                    if let Some(path) = PathBuilder::from_rect(button_rect).stroke(&stroke, 1.0) {
+                        pixmap.fill_path(
+                            &path, 
+                            &button_paint, 
+                            FillRule::Winding, 
+                            Transform::identity(), 
+                            None
+                        );
+                    }
+                    // --- End Drawing Logic ---
+
+                    // Copy tiny-skia's pixel data to softbuffer's buffer
+                    // Note: softbuffer expects u32 where each byte is ARGB/RGBA depending on platform.
+                    // This conversion is common for tiny-skia's RGBA data to softbuffer's ARGB-like u32
+                    for (i, pixel) in buffer.iter_mut().enumerate() {
+                        let data = pixmap.data();
+                        let r = data[i * 4];
+                        let g = data[i * 4 + 1];
+                        let b = data[i * 4 + 2];
+                        let a = data[i * 4 + 3];
+                        
+                        *pixel = u32::from_le_bytes([b, g, r, a]);
+                    }
+
+                    // Present the buffer to the window
+                    buffer.present().unwrap();
+                }
+                
+                // Keep requesting redraws for continuous animation/rendering
+                window.request_redraw();
+            }
+            _ => {}
+        }
+    }
+    
+    // Handle window destruction for cleanup (though not strictly necessary 
+    // for this simple example as the fields are Option)
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.window = None;
+    }
+}
+
+async fn initialize_gpu_state(window: Rc<Window>) -> GpuState {
+    let size = window.inner_size();
+    let width = NonZeroU32::new(size.width).unwrap();
+    let height = NonZeroU32::new(size.height).unwrap();
+    let instance = Instance::new(&InstanceDescriptor::from_env_or_default());
+    let surface = unsafe {
+        instance.create_surface(&*window).unwrap()
+    };
+    let adapter = instance.request_adapter(&RequestAdapterOptions::default()).await.unwrap();
+    let (device, queue) = adapter.request_device(&DeviceDescriptor::default()).await.expect("failed at adapter.request_device");
+
+    let swapchain_capabilities = surface.get_capabilities(&adapter);
+    let swapchain_format = swapchain_capabilities.formats[0]; 
+                                                              
+    let config = SurfaceConfiguration {
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format: swapchain_format,
+        width: width.get(),
+        height: height.get(),
+        present_mode: wgpu::PresentMode::Immediate,
+        alpha_mode: swapchain_capabilities.alpha_modes[0],
+        view_formats: vec![],
+        desired_maximum_frame_latency: 2,
+    };
+
+    let backend_context = unsafe {
+        BackendContext::new(instance, _, device, (queue, 0), _) 
+    };
+    let skia_config = skia_safe::gpu::direct_contexts::make_vulkan(BackendContext::new(instance, physical_device, device, _, get_proc), options)
+
+    GpuState {
+        instance,
+        surface,
+        device, 
+        queue,
+        config,
+    }
+}
+
+fn main() -> Result<(), EventLoopError> {
+    let initial_button_rect = Rect::from_xywh(30.0, 30.0, 30.0, 30.0).unwrap();
+    let event_loop = EventLoop::new().unwrap();
+    
+    // --- Window Creation for Desktop Platforms ---
+    // On desktop, the window is often created here to ensure it exists 
+    // immediately, as `resumed` may not fire.
+    let initial_attrs = WindowAttributes::default()
+        .with_title("gamer")
+        .with_inner_size(PhysicalSize::new(400, 400));
+        
+    match event_loop.create_window(initial_attrs) {
+        Ok(window) => {
+            let rc_window = Rc::new(window);
+                let mut app = App { 
+                    window: None, 
+                    gpu_state: GpuState {
+                        instance,
+                        surface,
+                        device: 
+                    },
+                    button: Button {
+                        rect: initial_button_rect,
+                        is_hovered: false,
+                        is_pressed: false,
+                    },
+                };
+            
+            // Initialize softbuffer context and surface
+            let context = Context::new(rc_window.clone()).unwrap();
+            let surface = Surface::new(&context, rc_window.clone()).unwrap();
+
+            app.context = Some(context);
+            app.window = Some(rc_window);
+            app.window_state = Some(WindowState { surface });
+            
+            // Request the first redraw
+            app.window.as_ref().unwrap().request_redraw();
+        },
+        Err(e) => eprintln!("Failed to create initial window: {:?}", e),
+    }
+
+    // `run_app` blocks and starts the event loop
+    let _ = event_loop.run_app(&mut app);
+
+    Ok(())
+}

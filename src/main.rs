@@ -1,56 +1,251 @@
-use winit::dpi::{LogicalPosition, PhysicalSize};
+mod canvas;
+mod ecs;
+
+use glutin::config::{Config, ConfigTemplateBuilder, GlConfig};
+use glutin::context::{ContextAttributesBuilder, PossiblyCurrentContext};
+use glutin::display::GetGlDisplay;
+use glutin::prelude::{GlDisplay, NotCurrentGlContext, PossiblyCurrentGlContext};
+use glutin::surface::{GlSurface, Surface, SurfaceAttributesBuilder, WindowSurface};
+use glutin_winit::{DisplayBuilder, GlWindow};
+
+use skia_safe::gpu::backend_render_targets::make_gl;
+use skia_safe::gpu::surfaces::wrap_backend_render_target;
+use skia_safe::gpu::{direct_contexts, BackendRenderTarget, Budgeted, DirectContext, Protected, SurfaceOrigin};
+use skia_safe::gpu::gl::{Format, FramebufferInfo, Interface};
+use skia_safe::{Canvas, Color, Color4f, ColorType, Image, Matrix, Paint, Point, Rect};
+use winit::dpi::{LogicalPosition, PhysicalPosition, PhysicalSize};
 use winit::error::EventLoopError;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, Ime, KeyEvent, Modifiers, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{KeyCode, ModifiersKeyState, PhysicalKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+use winit::platform::scancode::PhysicalKeyExtScancode;
+use winit::raw_window_handle::{self, HasRawWindowHandle, HasWindowHandle};
 use winit::window::{Window, WindowAttributes, WindowId};
-use softbuffer::{Context, Surface};
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Rect, Stroke, Transform};
+
+use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 
-// A simple structure to hold the drawing context for the window.
-struct WindowState {
-    surface: Surface<Rc<Window>, Rc<Window>>,
+#[derive(PartialEq, Eq, Clone)]
+enum InteractableState {
+    DEFAULT,
+    HOVERED,
+    PRESSED,
+}
+
+impl InteractableState {
+    fn color(&self) -> Color4f {
+        match self {
+            InteractableState::DEFAULT => Color4f::new(0.5, 0.5, 0.5, 1.0),
+            InteractableState::HOVERED => Color4f::new(0.6, 0.6, 0.6, 1.0),
+            InteractableState::PRESSED => Color4f::new(0.3, 0.3, 0.3, 1.0),
+        }
+    }
 }
 
 struct Button {
     rect: Rect,
-    is_hovered: bool,
-    is_pressed: bool,
+    state: InteractableState,
+    function: Box<dyn FnMut()>,
+}
+
+impl Button {
+    fn update_hover(&mut self, x: f32, y: f32) -> bool {
+        let old = self.state.clone();
+        self.state = {
+            let rect = self.rect;
+            if x >= rect.left() && x <= rect.right() && y >= rect.top() && y <= rect.bottom() {
+                if self.state == InteractableState::DEFAULT {
+                    InteractableState::HOVERED
+                } else {
+                    self.state.clone()
+                }
+            } else {
+                InteractableState::DEFAULT
+            }
+        };
+        old != self.state
+    }
+
+    fn update_press(&mut self, mb: MouseButton, state: ElementState) -> bool {
+        let old = self.state.clone();
+        if mb != MouseButton::Left {
+            return false;
+        }
+        match self.state {
+            InteractableState::HOVERED => {
+               if state == ElementState::Pressed { 
+                    self.state = InteractableState::PRESSED;
+                    self.trigger();
+               };
+            }
+            InteractableState::PRESSED => {
+                if state == ElementState::Released {
+                    self.state = InteractableState::HOVERED;
+                };
+            }
+            _ => {
+                return false;
+            }
+        };
+        return old != self.state;
+    }
+
+    fn draw(&self, canvas: &Canvas) {
+        let paint: Paint = Paint::new(
+            self.state.color(),
+            None
+        );
+        canvas.draw_rect(self.rect, &paint);
+    }
+
+    fn trigger(&mut self) {
+        (self.function)();
+    }
+}
+
+struct GpuState {
+    gl_context: PossiblyCurrentContext,
+    gl_config: Config,
+    gl_surface: Surface<WindowSurface>,
+    gr_context: DirectContext,
+    skia_surface: Option<skia_safe::Surface>,
+    window: Rc<Window>,
+}
+
+struct TestCanvas {
+    rect: Rect,
+    is_drawing: bool,
+    paint: Paint,
+    surface: Option<skia_safe::Surface>,
+    history: Vec<Image>,
+    history_index: usize,
+    max_history: usize,
+}
+
+impl TestCanvas {
+    fn update_drawing(&mut self, mb: MouseButton, state: ElementState) {
+        if state == ElementState::Released {
+            self.is_drawing = false;
+            self.save_state();
+            return
+        }
+        if mb == MouseButton::Left {
+            self.is_drawing = true;
+        }
+    }
+    fn draw(&mut self, old_x: f32, old_y: f32, x: f32, y: f32) {
+        let rect = self.rect;
+        if let Some(surface) = &mut self.surface {
+            let canvas = surface.canvas();
+            if x >= rect.left() && x <= rect.right() && y >= rect.top() && y <= rect.bottom() {
+                canvas.draw_line(Point::new(old_x, old_y), Point::new(x, y), &self.paint);
+            }
+        }
+    }
+    fn save_state(&mut self) {
+        let Some(surface) = &mut self.surface else { return; };
+
+        self.history.truncate(self.history_index);
+        let snapshot = surface.image_snapshot();
+
+        self.history.push(snapshot);
+
+        self.history_index += 1;
+
+        if self.history.len() > self.max_history {
+            self.history.remove(0);
+            self.history_index -= 1;
+        }
+    }
+
+    fn undo(&mut self, gr_context: &mut DirectContext) -> bool {
+        if self.history_index <= 1 {
+            return false;
+        }
+
+        self.history_index -= 1;
+        self.restore_state(gr_context);
+        true
+    }
+
+    fn redo(&mut self, gr_context: &mut DirectContext) -> bool {
+        if self.history_index >= self.history.len() {
+            return false;
+        }
+
+        self.history_index += 1;
+        self.restore_state(gr_context);
+        true
+    }
+
+    fn restore_state(&mut self, gr_context: &mut DirectContext) {
+        let Some(surface) = &mut self.surface else { return; };
+        let image_to_restore = self.history.get(self.history_index - 1).expect("undo out of bounds!!");
+
+        let canvas = surface.canvas();
+        canvas.clear(Color::TRANSPARENT);
+
+        canvas.draw_image(image_to_restore, (0.0, 0.0), None);
+
+        gr_context.flush_and_submit();
+    }
 }
 
 struct App {
-    window: Option<Rc<Window>>,
-    window_state: Option<WindowState>,
-    // Store the softbuffer Context as well.
-    // It must outlive the Surface.
-    context: Option<Context<Rc<Window>>>,
+    gpu_state: Option<GpuState>,
+    prev_cursor_pos: PhysicalPosition<f32>,
+    modifiers: Modifiers,
     button: Button,
+    canvas: TestCanvas,
+}
+
+impl GpuState {
+    fn create_skia_surface(&mut self, size: PhysicalSize<u32>) {
+        let _ = self.gl_context.make_current(&self.gl_surface).unwrap();
+        let fb_info = FramebufferInfo {
+            fboid: 0,
+            format: Format::RGBA8.into(),
+            protected: skia_safe::gpu::Protected::No,
+        };
+
+        let _sample_count = self.gl_config.num_samples() as usize;
+        let stencil_bits = self.gl_config.stencil_size() as usize;
+
+        let backend_render_target = make_gl(
+            (size.width as i32, size.height as i32),
+            Some(0),
+            stencil_bits,
+            fb_info);
+
+        unsafe {
+            gl::Viewport(0, 0, size.width as i32, size.height as i32);
+        };
+
+        self.skia_surface = Some(wrap_backend_render_target(
+                &mut self.gr_context,
+                &backend_render_target,
+                skia_safe::gpu::SurfaceOrigin::BottomLeft,
+                ColorType::N32,
+                None,
+                None
+        ).expect("failed to create skia surface"));
+    }
+}
+
+fn create_canvas_skia_surface(gr_context: &mut DirectContext, rect: Rect) -> skia_safe::Surface {
+    let size = rect.size().to_floor();
+    let image_info = skia_safe::ImageInfo::new((size.width, size.height), ColorType::N32, skia_safe::AlphaType::Premul, None);
+    skia_safe::gpu::surfaces::render_target(gr_context, Budgeted::Yes, &image_info, None, SurfaceOrigin::TopLeft, None, None, false).unwrap()
 }
 
 impl winit::application::ApplicationHandler<()> for App {
-    // 1. On platforms without a formal lifecycle, the window should be created 
-    // immediately in `main` or here if the platform requires it, but in our 
-    // case, we create it in main for desktop platforms for simplicity.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // This is primarily for Android/iOS, but can be a fallback.
-        if self.window.is_none() {
-            // For desktop, this logic should generally be in main.
-            // On non-desktop, this is the correct place.
+        if self.gpu_state.is_none() {
             let attrs = WindowAttributes::default().with_title("gamer");
             match event_loop.create_window(attrs) {
                 Ok(window) => {
-                    let rc_window = Rc::new(window);
-                    
-                    // Initialize softbuffer context and surface
-                    let context = Context::new(rc_window.clone()).unwrap();
-                    let surface = Surface::new(&context, rc_window.clone()).unwrap();
-
-                    self.context = Some(context);
-                    self.window = Some(rc_window);
-                    self.window_state = Some(WindowState { surface });
-                    
-                    self.window.as_ref().unwrap().request_redraw();
                 },
                 Err(e) => eprintln!("Failed to create window: {:?}", e),
             }
@@ -63,124 +258,89 @@ impl winit::application::ApplicationHandler<()> for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(window) = self.window.as_ref() else {
-            return;
-        };
-
-        if window_id != window.id() {
+        let Some(gpu_state) = self.gpu_state.as_mut() else { return; };
+        if window_id != gpu_state.window.id() {
             return;
         }
 
         match event {
             WindowEvent::CloseRequested => {
-                println!("it was closed");
-                // The event loop will exit naturally if all windows are dropped 
-                // in the `ApplicationHandler` implementation. For a single-window
-                // app, simply dropping the window will exit.
-                self.window = None;
-                self.window_state = None;
-                self.context = None;
                 event_loop.exit();
             }
+            WindowEvent::Resized(size) => {
+                let width = NonZeroU32::new(size.width).unwrap_or(NonZeroU32::new(1).unwrap());
+                let height = NonZeroU32::new(size.height).unwrap_or(NonZeroU32::new(1).unwrap());
+
+                gpu_state.gl_surface.resize(&gpu_state.gl_context, width, height);
+
+                gpu_state.create_skia_surface(size);
+                gpu_state.window.request_redraw();
+            }
             WindowEvent::CursorMoved { device_id, position } => {
-                let physical_pos: LogicalPosition<f32> = position.to_logical(window.scale_factor());
-                //let x = physical_pos.x as f32;
-                //let y = physical_pos.y as f32;
                 let x = position.x as f32;
                 let y = position.y as f32;
 
-                let was_hovered = self.button.is_hovered;
-                self.button.is_hovered = {
-                    let rect = self.button.rect;
-                    x >= rect.left() && x <= rect.right() && y >= rect.top() && y <= rect.bottom()
-                };
-
-                if was_hovered != self.button.is_hovered {
-                    window.request_redraw();
+                if self.button.update_hover(x, y) {
+                    gpu_state.window.request_redraw();
                 }
+                if self.canvas.is_drawing {
+                    self.canvas.draw(self.prev_cursor_pos.x, self.prev_cursor_pos.y, x, y);
+                    gpu_state.window.request_redraw();
+                }
+                self.prev_cursor_pos = PhysicalPosition { x, y };
+            }
+            WindowEvent::MouseInput { device_id, state, button } => {
+                if self.button.update_press(button, state) {
+                    gpu_state.window.request_redraw();
+                }
+                self.canvas.update_drawing(button, state);
             }
             WindowEvent::RedrawRequested => {
-                if let Some(state) = &mut self.window_state {
-                    let size = window.inner_size();
-                    let width = NonZeroU32::new(size.width).unwrap_or(NonZeroU32::new(1).unwrap());
-                    let height = NonZeroU32::new(size.height).unwrap_or(NonZeroU32::new(1).unwrap());
-
-                    // Resize the surface if necessary
-                    state.surface.resize(width, height).unwrap();
-                    
-                    // Get the buffer to draw to
-                    let mut buffer = state.surface.buffer_mut().unwrap();
-
-                    // --- Drawing with tiny-skia (The "White Box" logic) ---
-                    let mut pixmap = tiny_skia::Pixmap::new(width.get(), height.get()).unwrap();
-                    
-                    // Fill the entire pixmap with a background color (e.g., black)
-                    pixmap.fill(Color::from_rgba8(0, 0, 0, 255));
-                    
-                    // Define a white paint
-                    let mut paint = Paint::default();
-                    paint.set_color_rgba8(255, 255, 255, 255); // White color
-                    
-                    // Create a path for a rectangle (e.g., 100x100 box in the center)
-                    let rect_width = 100.0;
-                    let rect_height = 100.0;
-                    let x = (width.get() as f32 - rect_width) / 2.0;
-                    let y = (height.get() as f32 - rect_height) / 2.0;
-                    
-                    let rect_path = PathBuilder::from_rect(
-                        tiny_skia::Rect::from_xywh(x, y, rect_width, rect_height).unwrap(),
-                    );
-                    
-                    let mut stroke = Stroke::default();
-
-                    // Draw the white box
-                    pixmap.fill_path(
-                        &rect_path.stroke(&stroke, 32.0).unwrap(),
-                        &paint,
-                        FillRule::Winding,
-                        Transform::identity(),
-                        None,
-                    );
-
-                    let button_rect = self.button.rect;
-                    let mut button_paint = Paint::default();
-                    if self.button.is_pressed {
-                        button_paint.set_color_rgba8(50, 50, 50, 100);
-                    } else if self.button.is_hovered {
-                        button_paint.set_color_rgba8(100, 100, 100, 100);
-                    } else {
-                        button_paint.set_color_rgba8(255, 255, 255, 100);
-                    }
-                    if let Some(path) = PathBuilder::from_rect(button_rect).stroke(&stroke, 1.0) {
-                        pixmap.fill_path(
-                            &path, 
-                            &button_paint, 
-                            FillRule::Winding, 
-                            Transform::identity(), 
-                            None
-                        );
-                    }
-                    // --- End Drawing Logic ---
-
-                    // Copy tiny-skia's pixel data to softbuffer's buffer
-                    // Note: softbuffer expects u32 where each byte is ARGB/RGBA depending on platform.
-                    // This conversion is common for tiny-skia's RGBA data to softbuffer's ARGB-like u32
-                    for (i, pixel) in buffer.iter_mut().enumerate() {
-                        let data = pixmap.data();
-                        let r = data[i * 4];
-                        let g = data[i * 4 + 1];
-                        let b = data[i * 4 + 2];
-                        let a = data[i * 4 + 3];
-                        
-                        *pixel = u32::from_le_bytes([b, g, r, a]);
-                    }
-
-                    // Present the buffer to the window
-                    buffer.present().unwrap();
+                if gpu_state.skia_surface.is_none() {
+                    gpu_state.create_skia_surface(gpu_state.window.inner_size());
                 }
-                
-                // Keep requesting redraws for continuous animation/rendering
-                window.request_redraw();
+                if let (Some(surface), Some(canvas_surface)) = (&mut gpu_state.skia_surface, &mut self.canvas.surface) {
+                    let canvas = surface.canvas();
+
+                    canvas.clear(Color::from_rgb(200, 200, 200));
+                    self.button.draw(canvas);
+                    let canvas_image = canvas_surface.image_snapshot();
+
+                    canvas.draw_image(canvas_image, Point::new(self.canvas.rect.left(), self.canvas.rect.top()), None);
+
+                    gpu_state.gr_context.flush_and_submit();
+                    gpu_state.gl_surface.swap_buffers(&gpu_state.gl_context).unwrap();
+                }
+            }
+            WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
+                let ctrl_pressed = self.modifiers.state().control_key();
+                match event.physical_key {
+                    PhysicalKey::Code(key_code) => {
+                        match key_code {
+                            KeyCode::KeyW => {
+                                self.canvas.paint.set_stroke_width(self.canvas.paint.stroke_width() + 1.0);
+                            }
+                            KeyCode::KeyS => {
+                                self.canvas.paint.set_stroke_width(self.canvas.paint.stroke_width() - 1.0);
+                            }
+                            KeyCode::KeyZ => {
+                                if event.state == ElementState::Released { return; };
+                                if ctrl_pressed {
+                                    self.canvas.redo(&mut gpu_state.gr_context);
+                                }
+                                else {
+                                    self.canvas.undo(&mut gpu_state.gr_context);
+                                }
+                                gpu_state.window.request_redraw();
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers;
             }
             _ => {}
         }
@@ -189,52 +349,104 @@ impl winit::application::ApplicationHandler<()> for App {
     // Handle window destruction for cleanup (though not strictly necessary 
     // for this simple example as the fields are Option)
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.window = None;
-        self.window_state = None;
-        self.context = None;
+        self.gpu_state = None;
     }
 }
 
 fn main() -> Result<(), EventLoopError> {
-    let initial_button_rect = Rect::from_xywh(30.0, 30.0, 30.0, 30.0).unwrap();
-    let mut app = App { 
-        window: None, 
-        window_state: None,
-        context: None,
-        button: Button {
-            rect: initial_button_rect,
-            is_hovered: false,
-            is_pressed: false,
-        },
-    };
+    let initial_button_rect = Rect::from_xywh(30.0, 30.0, 30.0, 30.0);
     let event_loop = EventLoop::new().unwrap();
     
-    // --- Window Creation for Desktop Platforms ---
-    // On desktop, the window is often created here to ensure it exists 
-    // immediately, as `resumed` may not fire.
     let initial_attrs = WindowAttributes::default()
         .with_title("gamer")
         .with_inner_size(PhysicalSize::new(400, 400));
-        
-    match event_loop.create_window(initial_attrs) {
-        Ok(window) => {
-            let rc_window = Rc::new(window);
-            
-            // Initialize softbuffer context and surface
-            let context = Context::new(rc_window.clone()).unwrap();
-            let surface = Surface::new(&context, rc_window.clone()).unwrap();
 
-            app.context = Some(context);
-            app.window = Some(rc_window);
-            app.window_state = Some(WindowState { surface });
-            
-            // Request the first redraw
-            app.window.as_ref().unwrap().request_redraw();
+    let config_template_builder = ConfigTemplateBuilder::new();
+    let display_builder = DisplayBuilder::new().with_window_attributes(Some(initial_attrs));
+
+    let (window, gl_config) = display_builder
+        .build(&event_loop, config_template_builder, |configs| {
+            configs
+                .reduce(|accum, config| {
+                    if config.num_samples() > accum.num_samples() {
+                        config
+                    } else {
+                        accum
+                    }
+                })
+            .unwrap()
+            })
+    .unwrap();
+
+    let window = Rc::new(window.unwrap());
+    let raw_window_handle = window.window_handle().unwrap().as_raw();
+
+    let gl_display = gl_config.display();
+    let context_attributes = ContextAttributesBuilder::new().build(Some(raw_window_handle));
+    let not_current_gl_context = unsafe {
+        gl_display.create_context(&gl_config, &context_attributes).expect("couldnt make gl display create context")
+    };
+    let inner_size = window.inner_size();
+    let width = NonZeroU32::new(inner_size.width).unwrap();
+    let height = NonZeroU32::new(inner_size.height).unwrap();
+    let surface_attributes = SurfaceAttributesBuilder::<WindowSurface>::new().build(raw_window_handle, width, height);
+    let gl_surface = unsafe {
+        gl_display.create_window_surface(&gl_config, &surface_attributes).expect("could not make surface")
+    };
+    let gl_context = not_current_gl_context.make_current(&gl_surface).unwrap();
+
+    gl::load_with(|symbol| {
+        let symbol = CString::new(symbol).unwrap();
+        gl_display.get_proc_address(&symbol).cast()
+    });
+
+    let gl_interface = Interface::new_load_with(|symbol| {
+        let symbol = CString::new(symbol).unwrap();
+        gl_display.get_proc_address(&symbol).cast()
+    }).expect("Skia failed to load required GL functions!"); 
+
+    let mut gr_context = direct_contexts::make_gl(gl_interface, None).expect("failed to create gr_context");
+
+    let canvas_rect = Rect::from_wh(800.0, 800.0);
+    let mut canvas_skia_surface = create_canvas_skia_surface(&mut gr_context, canvas_rect);
+    let mut canvas_paint = Paint::new(Color4f::new(0.0, 0.0, 0.0, 1.0), None);
+    canvas_paint.set_stroke_cap(skia_safe::PaintCap::Round);
+
+    let gpu_state = GpuState { 
+        gl_context,
+        gl_config,
+        gl_surface,
+        gr_context,
+        skia_surface: None,
+        window: window.clone(),
+    };
+
+    let mut canvas_history = Vec::new();
+    canvas_history.push(canvas_skia_surface.image_snapshot());
+
+    let mut app = App {
+        gpu_state: Some(gpu_state),
+        canvas: TestCanvas {
+            surface: Some(canvas_skia_surface),
+            rect: canvas_rect,
+            is_drawing: false,
+            paint: canvas_paint,
+            history: canvas_history,
+            history_index: 1,
+            max_history: 20,
         },
-        Err(e) => eprintln!("Failed to create initial window: {:?}", e),
-    }
+        button: Button {
+            rect: initial_button_rect,
+            state: InteractableState::DEFAULT,
+            function: Box::new(move || println!("gamer")),
+        },
+        prev_cursor_pos: PhysicalPosition { x: 0.0, y: 0.0 },
+        modifiers: Modifiers::default(),
+    };
 
-    // `run_app` blocks and starts the event loop
+    window.set_visible(true);
+    window.request_redraw();
+
     let _ = event_loop.run_app(&mut app);
 
     Ok(())
