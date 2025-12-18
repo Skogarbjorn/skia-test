@@ -1,7 +1,9 @@
-mod canvas;
-mod ecs;
+pub mod implementations;
+pub mod canvas;
+pub mod ecs;
+pub mod graphics;
 
-use glutin::config::{Config, ConfigTemplateBuilder, GlConfig};
+use glutin::config::{ConfigTemplateBuilder, GlConfig};
 use glutin::context::{ContextAttributesBuilder, PossiblyCurrentContext};
 use glutin::display::GetGlDisplay;
 use glutin::prelude::{GlDisplay, NotCurrentGlContext, PossiblyCurrentGlContext};
@@ -12,7 +14,7 @@ use skia_safe::gpu::backend_render_targets::make_gl;
 use skia_safe::gpu::surfaces::wrap_backend_render_target;
 use skia_safe::gpu::{direct_contexts, BackendRenderTarget, Budgeted, DirectContext, Protected, SurfaceOrigin};
 use skia_safe::gpu::gl::{Format, FramebufferInfo, Interface};
-use skia_safe::{Canvas, Color, Color4f, ColorType, Image, Matrix, Paint, Point, Rect};
+use skia_safe::{Canvas, Color, Color4f, ColorType, Image, Matrix, Paint, Point, Rect, Vector};
 use winit::dpi::{LogicalPosition, PhysicalPosition, PhysicalSize};
 use winit::error::EventLoopError;
 use winit::event::{ElementState, Ime, KeyEvent, Modifiers, MouseButton, WindowEvent};
@@ -26,6 +28,8 @@ use winit::window::{Window, WindowAttributes, WindowId};
 use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::rc::Rc;
+
+use crate::ecs::{Bounds, DirtyVisual, Entity, GpuState, Interactable, Parallax, Quad, Resources, Transform, World, render_quads};
 
 #[derive(PartialEq, Eq, Clone)]
 enum InteractableState {
@@ -44,194 +48,9 @@ impl InteractableState {
     }
 }
 
-struct Button {
-    rect: Rect,
-    state: InteractableState,
-    function: Box<dyn FnMut()>,
-}
-
-impl Button {
-    fn update_hover(&mut self, x: f32, y: f32) -> bool {
-        let old = self.state.clone();
-        self.state = {
-            let rect = self.rect;
-            if x >= rect.left() && x <= rect.right() && y >= rect.top() && y <= rect.bottom() {
-                if self.state == InteractableState::DEFAULT {
-                    InteractableState::HOVERED
-                } else {
-                    self.state.clone()
-                }
-            } else {
-                InteractableState::DEFAULT
-            }
-        };
-        old != self.state
-    }
-
-    fn update_press(&mut self, mb: MouseButton, state: ElementState) -> bool {
-        let old = self.state.clone();
-        if mb != MouseButton::Left {
-            return false;
-        }
-        match self.state {
-            InteractableState::HOVERED => {
-               if state == ElementState::Pressed { 
-                    self.state = InteractableState::PRESSED;
-                    self.trigger();
-               };
-            }
-            InteractableState::PRESSED => {
-                if state == ElementState::Released {
-                    self.state = InteractableState::HOVERED;
-                };
-            }
-            _ => {
-                return false;
-            }
-        };
-        return old != self.state;
-    }
-
-    fn draw(&self, canvas: &Canvas) {
-        let paint: Paint = Paint::new(
-            self.state.color(),
-            None
-        );
-        canvas.draw_rect(self.rect, &paint);
-    }
-
-    fn trigger(&mut self) {
-        (self.function)();
-    }
-}
-
-struct GpuState {
-    gl_context: PossiblyCurrentContext,
-    gl_config: Config,
-    gl_surface: Surface<WindowSurface>,
-    gr_context: DirectContext,
-    skia_surface: Option<skia_safe::Surface>,
-    window: Rc<Window>,
-}
-
-struct TestCanvas {
-    rect: Rect,
-    is_drawing: bool,
-    paint: Paint,
-    surface: Option<skia_safe::Surface>,
-    history: Vec<Image>,
-    history_index: usize,
-    max_history: usize,
-}
-
-impl TestCanvas {
-    fn update_drawing(&mut self, mb: MouseButton, state: ElementState) {
-        if state == ElementState::Released {
-            self.is_drawing = false;
-            self.save_state();
-            return
-        }
-        if mb == MouseButton::Left {
-            self.is_drawing = true;
-        }
-    }
-    fn draw(&mut self, old_x: f32, old_y: f32, x: f32, y: f32) {
-        let rect = self.rect;
-        if let Some(surface) = &mut self.surface {
-            let canvas = surface.canvas();
-            if x >= rect.left() && x <= rect.right() && y >= rect.top() && y <= rect.bottom() {
-                canvas.draw_line(Point::new(old_x, old_y), Point::new(x, y), &self.paint);
-            }
-        }
-    }
-    fn save_state(&mut self) {
-        let Some(surface) = &mut self.surface else { return; };
-
-        self.history.truncate(self.history_index);
-        let snapshot = surface.image_snapshot();
-
-        self.history.push(snapshot);
-
-        self.history_index += 1;
-
-        if self.history.len() > self.max_history {
-            self.history.remove(0);
-            self.history_index -= 1;
-        }
-    }
-
-    fn undo(&mut self, gr_context: &mut DirectContext) -> bool {
-        if self.history_index <= 1 {
-            return false;
-        }
-
-        self.history_index -= 1;
-        self.restore_state(gr_context);
-        true
-    }
-
-    fn redo(&mut self, gr_context: &mut DirectContext) -> bool {
-        if self.history_index >= self.history.len() {
-            return false;
-        }
-
-        self.history_index += 1;
-        self.restore_state(gr_context);
-        true
-    }
-
-    fn restore_state(&mut self, gr_context: &mut DirectContext) {
-        let Some(surface) = &mut self.surface else { return; };
-        let image_to_restore = self.history.get(self.history_index - 1).expect("undo out of bounds!!");
-
-        let canvas = surface.canvas();
-        canvas.clear(Color::TRANSPARENT);
-
-        canvas.draw_image(image_to_restore, (0.0, 0.0), None);
-
-        gr_context.flush_and_submit();
-    }
-}
-
 struct App {
-    gpu_state: Option<GpuState>,
-    prev_cursor_pos: PhysicalPosition<f32>,
-    modifiers: Modifiers,
-    button: Button,
-    canvas: TestCanvas,
-}
-
-impl GpuState {
-    fn create_skia_surface(&mut self, size: PhysicalSize<u32>) {
-        let _ = self.gl_context.make_current(&self.gl_surface).unwrap();
-        let fb_info = FramebufferInfo {
-            fboid: 0,
-            format: Format::RGBA8.into(),
-            protected: skia_safe::gpu::Protected::No,
-        };
-
-        let _sample_count = self.gl_config.num_samples() as usize;
-        let stencil_bits = self.gl_config.stencil_size() as usize;
-
-        let backend_render_target = make_gl(
-            (size.width as i32, size.height as i32),
-            Some(0),
-            stencil_bits,
-            fb_info);
-
-        unsafe {
-            gl::Viewport(0, 0, size.width as i32, size.height as i32);
-        };
-
-        self.skia_surface = Some(wrap_backend_render_target(
-                &mut self.gr_context,
-                &backend_render_target,
-                skia_safe::gpu::SurfaceOrigin::BottomLeft,
-                ColorType::N32,
-                None,
-                None
-        ).expect("failed to create skia surface"));
-    }
+    world: World,
+    resources: Resources,
 }
 
 fn create_canvas_skia_surface(gr_context: &mut DirectContext, rect: Rect) -> skia_safe::Surface {
@@ -242,7 +61,7 @@ fn create_canvas_skia_surface(gr_context: &mut DirectContext, rect: Rect) -> ski
 
 impl winit::application::ApplicationHandler<()> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.gpu_state.is_none() {
+        if self.resources.gpu_state.is_none() {
             let attrs = WindowAttributes::default().with_title("gamer");
             match event_loop.create_window(attrs) {
                 Ok(window) => {
@@ -258,7 +77,7 @@ impl winit::application::ApplicationHandler<()> for App {
         window_id: WindowId,
         event: WindowEvent,
     ) {
-        let Some(gpu_state) = self.gpu_state.as_mut() else { return; };
+        let Some(ref mut gpu_state) = self.resources.gpu_state else { return; };
         if window_id != gpu_state.window.id() {
             return;
         }
@@ -279,68 +98,26 @@ impl winit::application::ApplicationHandler<()> for App {
             WindowEvent::CursorMoved { device_id, position } => {
                 let x = position.x as f32;
                 let y = position.y as f32;
-
-                if self.button.update_hover(x, y) {
-                    gpu_state.window.request_redraw();
-                }
-                if self.canvas.is_drawing {
-                    self.canvas.draw(self.prev_cursor_pos.x, self.prev_cursor_pos.y, x, y);
-                    gpu_state.window.request_redraw();
-                }
-                self.prev_cursor_pos = PhysicalPosition { x, y };
+                let should_redraw = hover_system(&mut self.world, x, y);
+                let parallax = parallax_system(&mut self.world, x, y);
+                if should_redraw || parallax { gpu_state.window.request_redraw(); }
             }
             WindowEvent::MouseInput { device_id, state, button } => {
-                if self.button.update_press(button, state) {
-                    gpu_state.window.request_redraw();
-                }
-                self.canvas.update_drawing(button, state);
             }
             WindowEvent::RedrawRequested => {
                 if gpu_state.skia_surface.is_none() {
                     gpu_state.create_skia_surface(gpu_state.window.inner_size());
                 }
-                if let (Some(surface), Some(canvas_surface)) = (&mut gpu_state.skia_surface, &mut self.canvas.surface) {
+                if let Some(surface) = &mut gpu_state.skia_surface {
                     let canvas = surface.canvas();
-
-                    canvas.clear(Color::from_rgb(200, 200, 200));
-                    self.button.draw(canvas);
-                    let canvas_image = canvas_surface.image_snapshot();
-
-                    canvas.draw_image(canvas_image, Point::new(self.canvas.rect.left(), self.canvas.rect.top()), None);
-
+                    render_system(&mut self.world, &canvas);
                     gpu_state.gr_context.flush_and_submit();
                     gpu_state.gl_surface.swap_buffers(&gpu_state.gl_context).unwrap();
                 }
             }
             WindowEvent::KeyboardInput { device_id, event, is_synthetic } => {
-                let ctrl_pressed = self.modifiers.state().control_key();
-                match event.physical_key {
-                    PhysicalKey::Code(key_code) => {
-                        match key_code {
-                            KeyCode::KeyW => {
-                                self.canvas.paint.set_stroke_width(self.canvas.paint.stroke_width() + 1.0);
-                            }
-                            KeyCode::KeyS => {
-                                self.canvas.paint.set_stroke_width(self.canvas.paint.stroke_width() - 1.0);
-                            }
-                            KeyCode::KeyZ => {
-                                if event.state == ElementState::Released { return; };
-                                if ctrl_pressed {
-                                    self.canvas.redo(&mut gpu_state.gr_context);
-                                }
-                                else {
-                                    self.canvas.undo(&mut gpu_state.gr_context);
-                                }
-                                gpu_state.window.request_redraw();
-                            }
-                            _ => {}
-                        }
-                    }
-                    _ => {}
-                }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
-                self.modifiers = modifiers;
             }
             _ => {}
         }
@@ -349,7 +126,100 @@ impl winit::application::ApplicationHandler<()> for App {
     // Handle window destruction for cleanup (though not strictly necessary 
     // for this simple example as the fields are Option)
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.gpu_state = None;
+        self.resources.gpu_state = None;
+    }
+}
+
+fn render_system(world: &mut World, canvas: &Canvas) {
+    canvas.clear(Color::from_rgb(200, 200, 200));
+    render_quads(world, canvas);
+}
+
+fn parallax_system(world: &mut World, x: f32, y: f32) -> bool {
+    let affected: Vec<(Entity, &Bounds, &Parallax, &Interactable)> = world.query3::<Bounds, Parallax, Interactable>().filter(|(_, _, _, interactable)| { interactable.state == InteractableState::HOVERED }).collect();
+    let mut affected_entities: Vec<Entity> = affected.iter().map(|(e, _, _, _)| *e).collect();
+    let any_affected = affected.len() > 0;
+    parallax_compute(world, &mut affected_entities, x, y);
+    any_affected
+}
+
+fn parallax_compute(world: &mut World, affected: &mut [Entity], x: f32, y: f32) {
+    let quad_storage = world.storage::<Quad>().unwrap();
+    let transform_storage = world.storage_mut::<Transform>().unwrap();
+
+    affected.iter_mut().for_each(|entity| {
+        let quad = quad_storage.data.get_mut(entity).unwrap();
+        let middle = quad.rect.center();
+        quad.rect.offset(Point::new(x - middle.x, y - middle.y)); 
+    });
+}
+
+fn hover_system(world: &mut World, x: f32, y: f32) -> bool {
+    let (hovered, not_hovered) = hover_detect(world, x, y);
+    let any_changed = hover_update(world, &hovered, &not_hovered);
+    let updates = compute_quad_colors(world);
+    apply_quad_colors(world, &updates);
+    any_changed
+}
+
+fn hover_detect(world: &World, x: f32, y: f32) -> (Vec<Entity>, Vec<Entity>) {
+    let mut hovered = Vec::new();
+    let mut not_hovered = Vec::new();
+    world.query2::<Bounds, Interactable>().for_each(|(entity, bounds, _)| {
+        let rect = bounds.rect;
+
+        let is_hovered =
+            x >= rect.left() && x <= rect.right() &&
+            y >= rect.top()  && y <= rect.bottom();
+
+        if is_hovered { hovered.push(entity); }
+        else { not_hovered.push(entity); }
+    });
+    (hovered, not_hovered)
+}
+
+fn hover_update(world: &mut World, hovered: &[Entity], not_hovered: &[Entity]) -> bool {
+    let mut changed = Vec::new();
+    {
+        let interactable_storage = world.storage_mut::<Interactable>().unwrap();
+        for &entity in hovered {
+            if let Some(i) = interactable_storage.data.get_mut(&entity) {
+                if i.state != InteractableState::HOVERED {
+                    i.state = InteractableState::HOVERED;
+                    changed.push(entity);
+                }
+            }
+        }
+        for &entity in not_hovered {
+            if let Some(i) = interactable_storage.data.get_mut(&entity) {
+                if i.state != InteractableState::DEFAULT {
+                    i.state = InteractableState::DEFAULT;
+                    changed.push(entity);
+                }
+            }
+        }
+    }
+
+    for e in &changed {
+        world.insert(*e, DirtyVisual);
+    }
+    changed.len() > 0
+}
+
+fn compute_quad_colors(world: &World) -> Vec<(Entity, Color4f)> {
+    world.query2::<Interactable, DirtyVisual>().map(|(entity, interactable, _)| {
+        let color = interactable.state.color();
+        (entity, color)
+    }).collect()
+}
+
+fn apply_quad_colors(world: &mut World, updates: &[(Entity, Color4f)]) {
+    let quads = world.storage_mut::<Quad>().unwrap();
+
+    for (entity, color) in updates {
+        if let Some(quad) = quads.data.get_mut(entity) {
+            quad.color = *color;
+        }
     }
 }
 
@@ -421,28 +291,19 @@ fn main() -> Result<(), EventLoopError> {
         window: window.clone(),
     };
 
-    let mut canvas_history = Vec::new();
-    canvas_history.push(canvas_skia_surface.image_snapshot());
+    let mut world = World::new();
+    add_button(&mut world, initial_button_rect);
+    add_button(&mut world, Rect::from_xywh(100.0, 200.0, 150.0, 300.0));
+
+    let resources = Resources::new(gpu_state);
 
     let mut app = App {
-        gpu_state: Some(gpu_state),
-        canvas: TestCanvas {
-            surface: Some(canvas_skia_surface),
-            rect: canvas_rect,
-            is_drawing: false,
-            paint: canvas_paint,
-            history: canvas_history,
-            history_index: 1,
-            max_history: 20,
-        },
-        button: Button {
-            rect: initial_button_rect,
-            state: InteractableState::DEFAULT,
-            function: Box::new(move || println!("gamer")),
-        },
-        prev_cursor_pos: PhysicalPosition { x: 0.0, y: 0.0 },
-        modifiers: Modifiers::default(),
+        world,
+        resources,
     };
+
+    let mut canvas_history = Vec::new();
+    canvas_history.push(canvas_skia_surface.image_snapshot());
 
     window.set_visible(true);
     window.request_redraw();
@@ -450,4 +311,12 @@ fn main() -> Result<(), EventLoopError> {
     let _ = event_loop.run_app(&mut app);
 
     Ok(())
+}
+
+fn add_button(world: &mut World, rect: Rect) {
+    let button_entity = world.spawn();
+    world.insert(button_entity, Bounds { rect });
+    world.insert(button_entity, Quad { rect, color: InteractableState::DEFAULT.color() } );
+    world.insert(button_entity, Interactable { state: InteractableState::DEFAULT } );
+    world.insert(button_entity, Parallax);
 }
