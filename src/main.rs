@@ -1,7 +1,6 @@
 pub mod implementations;
 pub mod canvas;
 pub mod ecs;
-pub mod graphics;
 
 use glutin::config::{ConfigTemplateBuilder, GlConfig};
 use glutin::context::{ContextAttributesBuilder, PossiblyCurrentContext};
@@ -14,7 +13,7 @@ use skia_safe::gpu::backend_render_targets::make_gl;
 use skia_safe::gpu::surfaces::wrap_backend_render_target;
 use skia_safe::gpu::{direct_contexts, BackendRenderTarget, Budgeted, DirectContext, Protected, SurfaceOrigin};
 use skia_safe::gpu::gl::{Format, FramebufferInfo, Interface};
-use skia_safe::{Canvas, Color, Color4f, ColorType, Image, Matrix, Paint, Point, Rect, Vector};
+use skia_safe::{Canvas, Color, Color4f, ColorType, Image, Matrix, Paint, Point, Rect};
 use winit::dpi::{LogicalPosition, PhysicalPosition, PhysicalSize};
 use winit::error::EventLoopError;
 use winit::event::{ElementState, Ime, KeyEvent, Modifiers, MouseButton, WindowEvent};
@@ -29,7 +28,7 @@ use std::ffi::CString;
 use std::num::NonZeroU32;
 use std::rc::Rc;
 
-use crate::ecs::{Bounds, DirtyVisual, Entity, GpuState, Interactable, Parallax, Quad, Resources, Transform, World, render_quads};
+use crate::ecs::{Bounds, Entity, GpuState, Interactable, Quad, Resources, Transform, World, render_quads};
 
 #[derive(PartialEq, Eq, Clone)]
 enum InteractableState {
@@ -98,9 +97,8 @@ impl winit::application::ApplicationHandler<()> for App {
             WindowEvent::CursorMoved { device_id, position } => {
                 let x = position.x as f32;
                 let y = position.y as f32;
-                let should_redraw = hover_system(&mut self.world, x, y);
-                let parallax = parallax_system(&mut self.world, x, y);
-                if should_redraw || parallax { gpu_state.window.request_redraw(); }
+                let should_update = hover_system(&mut self.world, x, y);
+                if should_update { gpu_state.window.request_redraw(); }
             }
             WindowEvent::MouseInput { device_id, state, button } => {
             }
@@ -110,7 +108,7 @@ impl winit::application::ApplicationHandler<()> for App {
                 }
                 if let Some(surface) = &mut gpu_state.skia_surface {
                     let canvas = surface.canvas();
-                    render_system(&mut self.world, &canvas);
+                    render_system(&self.world, &canvas);
                     gpu_state.gr_context.flush_and_submit();
                     gpu_state.gl_surface.swap_buffers(&gpu_state.gl_context).unwrap();
                 }
@@ -130,96 +128,42 @@ impl winit::application::ApplicationHandler<()> for App {
     }
 }
 
-fn render_system(world: &mut World, canvas: &Canvas) {
+fn render_system(world: &World, canvas: &Canvas) {
     canvas.clear(Color::from_rgb(200, 200, 200));
     render_quads(world, canvas);
 }
 
-fn parallax_system(world: &mut World, x: f32, y: f32) -> bool {
-    let affected: Vec<(Entity, &Bounds, &Parallax, &Interactable)> = world.query3::<Bounds, Parallax, Interactable>().filter(|(_, _, _, interactable)| { interactable.state == InteractableState::HOVERED }).collect();
-    let mut affected_entities: Vec<Entity> = affected.iter().map(|(e, _, _, _)| *e).collect();
-    let any_affected = affected.len() > 0;
-    parallax_compute(world, &mut affected_entities, x, y);
-    any_affected
-}
-
-fn parallax_compute(world: &mut World, affected: &mut [Entity], x: f32, y: f32) {
-    let quad_storage = world.storage::<Quad>().unwrap();
-    let transform_storage = world.storage_mut::<Transform>().unwrap();
-
-    affected.iter_mut().for_each(|entity| {
-        let quad = quad_storage.data.get_mut(entity).unwrap();
-        let middle = quad.rect.center();
-        quad.rect.offset(Point::new(x - middle.x, y - middle.y)); 
-    });
-}
-
 fn hover_system(world: &mut World, x: f32, y: f32) -> bool {
-    let (hovered, not_hovered) = hover_detect(world, x, y);
-    let any_changed = hover_update(world, &hovered, &not_hovered);
-    let updates = compute_quad_colors(world);
-    apply_quad_colors(world, &updates);
-    any_changed
+    let hovered = hover_detect(world, x, y);
+    hover_update(world, &hovered);
+    hovered.len() > 0
 }
 
-fn hover_detect(world: &World, x: f32, y: f32) -> (Vec<Entity>, Vec<Entity>) {
-    let mut hovered = Vec::new();
-    let mut not_hovered = Vec::new();
-    world.query2::<Bounds, Interactable>().for_each(|(entity, bounds, _)| {
-        let rect = bounds.rect;
+fn hover_detect(world: &World, x: f32, y: f32) -> Vec<Entity> {
+    let mut results = Vec::new();
+    world.query2::<Bounds, Interactable, _>(|entity, bounds, _| {
+            let rect = bounds.rect;
 
-        let is_hovered =
-            x >= rect.left() && x <= rect.right() &&
-            y >= rect.top()  && y <= rect.bottom();
+            let hovered =
+                x >= rect.left() && x <= rect.right() &&
+                y >= rect.top()  && y <= rect.bottom();
 
-        if is_hovered { hovered.push(entity); }
-        else { not_hovered.push(entity); }
+            if hovered { results.push(entity) }
     });
-    (hovered, not_hovered)
+    results
 }
 
-fn hover_update(world: &mut World, hovered: &[Entity], not_hovered: &[Entity]) -> bool {
-    let mut changed = Vec::new();
-    {
-        let interactable_storage = world.storage_mut::<Interactable>().unwrap();
-        for &entity in hovered {
-            if let Some(i) = interactable_storage.data.get_mut(&entity) {
-                if i.state != InteractableState::HOVERED {
-                    i.state = InteractableState::HOVERED;
-                    changed.push(entity);
-                }
-            }
-        }
-        for &entity in not_hovered {
-            if let Some(i) = interactable_storage.data.get_mut(&entity) {
-                if i.state != InteractableState::DEFAULT {
-                    i.state = InteractableState::DEFAULT;
-                    changed.push(entity);
-                }
-            }
-        }
+fn hover_update(world: &mut World, hovered: &[Entity]) {
+    let mut interactable_storage = world.storage_mut::<Interactable>().unwrap();
+    for entity in hovered {
+        println!("{}", entity.0);
+        let interactable = Some(interactable_storage.data.get_mut(entity).unwrap());
+        interactable.unwrap().state = InteractableState::HOVERED;
     }
-
-    for e in &changed {
-        world.insert(*e, DirtyVisual);
-    }
-    changed.len() > 0
-}
-
-fn compute_quad_colors(world: &World) -> Vec<(Entity, Color4f)> {
-    world.query2::<Interactable, DirtyVisual>().map(|(entity, interactable, _)| {
-        let color = interactable.state.color();
-        (entity, color)
-    }).collect()
-}
-
-fn apply_quad_colors(world: &mut World, updates: &[(Entity, Color4f)]) {
-    let quads = world.storage_mut::<Quad>().unwrap();
-
-    for (entity, color) in updates {
-        if let Some(quad) = quads.data.get_mut(entity) {
-            quad.color = *color;
-        }
+    let mut quad_storage = world.storage_mut::<Quad>().unwrap();
+    for entity in hovered {
+        let quad = quad_storage.data.get_mut(entity).unwrap();
+        quad.color = InteractableState::HOVERED.color();
     }
 }
 
@@ -292,8 +236,12 @@ fn main() -> Result<(), EventLoopError> {
     };
 
     let mut world = World::new();
-    add_button(&mut world, initial_button_rect);
-    add_button(&mut world, Rect::from_xywh(100.0, 200.0, 150.0, 300.0));
+    let button_entity = world.spawn();
+    world.insert(button_entity, Bounds { rect: initial_button_rect });
+    world.insert(button_entity, Quad { color: InteractableState::DEFAULT.color(), rect: initial_button_rect } );
+    world.insert(button_entity, Interactable { state: InteractableState::DEFAULT } );
+    world.insert(button_entity, Transform { local_to_parent: Matrix::new_identity(), z: 0.0 } );
+    println!("{}", button_entity.0);
 
     let resources = Resources::new(gpu_state);
 
@@ -311,12 +259,4 @@ fn main() -> Result<(), EventLoopError> {
     let _ = event_loop.run_app(&mut app);
 
     Ok(())
-}
-
-fn add_button(world: &mut World, rect: Rect) {
-    let button_entity = world.spawn();
-    world.insert(button_entity, Bounds { rect });
-    world.insert(button_entity, Quad { rect, color: InteractableState::DEFAULT.color() } );
-    world.insert(button_entity, Interactable { state: InteractableState::DEFAULT } );
-    world.insert(button_entity, Parallax);
 }

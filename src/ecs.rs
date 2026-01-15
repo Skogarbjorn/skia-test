@@ -1,7 +1,7 @@
-use std::{any::{Any, TypeId}, collections::HashMap, rc::Rc};
+use std::{any::{Any, TypeId, type_name}, cell::{Ref, RefCell, RefMut}, collections::HashMap, rc::Rc};
 
 use glutin::{config::Config, context::PossiblyCurrentContext, surface::{WindowSurface}};
-use skia_safe::{Canvas, Color4f, Image, Paint, Rect, Surface, Vector, gpu::DirectContext};
+use skia_safe::{Canvas, Color4f, Image, Matrix, Paint, Rect, Surface, Vector, gpu::DirectContext};
 use winit::{dpi::PhysicalPosition, event::Modifiers, window::Window};
 
 use crate::InteractableState;
@@ -11,7 +11,7 @@ pub struct Entity(pub u32);
 
 pub struct World {
     pub entities: Vec<Entity>,
-    pub storages: HashMap<TypeId, Box<dyn Any>>,
+    pub storages: HashMap<TypeId, RefCell<Box<dyn Any>>>,
 }
 
 /*
@@ -82,12 +82,37 @@ pub struct Interactable {
     pub state: InteractableState,
 }
 
-pub struct Parallax;
+pub struct Parallax {
+    pub strength: f32,
+}
 
+#[derive(Clone, Copy)]
 pub struct Transform {
-    translation: Vector,
-    scale: Vector,
-    z: f32,
+    pub local_to_parent: Matrix,
+    pub z: f32,
+}
+
+pub struct View<'a, T> {
+    storage: Ref<'a, Storage<T>>,
+}
+pub struct ViewMut<'a, T> {
+    storage: RefMut<'a, Storage<T>>,
+}
+impl<'a, T> View<'a, T> {
+    pub fn get(&self, entity: Entity) -> Option<&T> {
+        self.storage.data.get(&entity)
+    }
+    pub fn iter(&self) -> impl Iterator<Item = (Entity, &T)> {
+        self.storage.data.iter().map(|(e, c)| (*e, c))
+    }
+}
+impl<'a, T> ViewMut<'a, T> {
+    pub fn get_mut(&mut self, entity: Entity) -> Option<&mut T> {
+        self.storage.data.get_mut(&entity)
+    }
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Entity, &mut T)> {
+        self.storage.data.iter_mut().map(|(e, c)| (*e, c))
+    }
 }
 
 impl World {
@@ -108,72 +133,89 @@ impl World {
     pub fn insert<T: 'static>(self: &mut Self, entity: Entity, component: T) {
         let type_id = TypeId::of::<T>();
 
-        let storage = self.storages
-            .entry(type_id)
-            .or_insert_with(|| {
-                Box::new(Storage::<T> {
-                    data: HashMap::new(),
-                })
-            });
+        let cell = self.storages.entry(type_id).or_insert_with(|| {
+            RefCell::new(Box::new(Storage::<T> {
+                data: HashMap::new(),
+            }))
+        });
 
-        let storage = storage.downcast_mut::<Storage<T>>().unwrap();
-
+        let mut storage_any = cell.borrow_mut();
+        let storage = storage_any.downcast_mut::<Storage<T>>().unwrap();
         storage.data.insert(entity, component);
     }
 
-    pub fn storage<T: 'static>(&self) -> Option<&Storage<T>> {
-        self.storages
-            .get(&TypeId::of::<T>())
-            .and_then(|boxed| boxed.downcast_ref::<Storage<T>>())
+    pub fn storage<T: 'static>(&self) -> Option<Ref<Storage<T>>> {
+        let cell = self.storages.get(&TypeId::of::<T>())?;
+
+        Some(Ref::map(cell.borrow(), |boxed| {
+            boxed.downcast_ref::<Storage<T>>().unwrap()
+        }))
     }
 
-    pub fn storage_mut<T: 'static>(&mut self) -> Option<&mut Storage<T>> {
-        self.storages
-            .get_mut(&TypeId::of::<T>())
-            .and_then(|boxed| boxed.downcast_mut::<Storage<T>>())
+    pub fn storage_mut<T: 'static>(&self) -> Option<RefMut<Storage<T>>> {
+        let cell = self.storages.get(&TypeId::of::<T>())?;
+
+        Some(RefMut::map(cell.borrow_mut(), |boxed| {
+            boxed.downcast_mut::<Storage<T>>().unwrap()
+        }))
     }
 
-    pub fn query<T: 'static>(&self) -> impl Iterator<Item = (Entity, &T)> {
-        let store = self.storage::<T>();
-
-        store.into_iter()
-            .flat_map(move |t| {
-                t.data.iter().filter_map(|(entity, component)| {
-                    Some((*entity, component))
-                })
-            })
+    pub fn view<T: 'static>(&self) -> View<T> {
+        println!("{}", type_name::<T>());
+        View {
+            storage: self.storage::<T>().expect("Storage not initialized")
+        }
+    }
+    pub fn view_mut<T: 'static>(&self) -> ViewMut<T> {
+        ViewMut { 
+            storage: self.storage_mut::<T>().expect("Storage not initialized (mut version)")
+        }
     }
 
-    pub fn query2<A: 'static, B: 'static>(&self) -> impl Iterator<Item = (Entity, &A, &B)> {
+    pub fn query<T: 'static, F>(&self, mut f: F) 
+    where 
+        F: FnMut(Entity, &T) 
+    {
+        if let Some(store) = self.storage::<T>() {
+            for (entity, component) in store.data.iter() {
+                f(*entity, component);
+            }
+        }
+    }
+
+    pub fn query2<A: 'static, B: 'static, F>(&self, mut f: F)
+    where
+        F: FnMut(Entity, &A, &B)
+    {
         let a_store = self.storage::<A>();
         let b_store = self.storage::<B>();
 
-        a_store
-            .into_iter()
-            .flat_map(move |a| {
-                b_store.into_iter().flat_map(move |b| {
-                    a.data.iter().filter_map(|(entity, a_component)| {
-                        let b_component = b.data.get(entity)?;
-                        Some((*entity, a_component, b_component))
-                    })
-                })
-            })
+        if let (Some(a), Some(b)) = (a_store, b_store) {
+            for (entity, a_comp) in a.data.iter() {
+                if let Some(b_comp) = b.data.get(entity) {
+                    f(*entity, a_comp, b_comp);
+                }
+            }
+        }
     }
-    pub fn query3<A: 'static, B: 'static, C: 'static>(&self) -> impl Iterator<Item = (Entity, &A, &B, &C)> {
+
+    pub fn query3<A: 'static, B: 'static, C: 'static, F>(&self, mut f: F)
+    where
+        F: FnMut(Entity, &A, &B, &C)
+    {
         let a_store = self.storage::<A>();
         let b_store = self.storage::<B>();
         let c_store = self.storage::<C>();
 
-        a_store.into_iter().flat_map(move |a| {
-            let b = b_store.unwrap();
-            let c = c_store.unwrap();
-
-            a.data.iter().filter_map(|(entity, a_component)| {
-                let b_component = b.data.get(entity)?;
-                let c_component = c.data.get(entity)?;
-                Some((*entity, a_component, b_component, c_component))
-            })
-        })
+        if let (Some(a), Some(b), Some(c)) = (a_store, b_store, c_store) {
+            for (entity, a_comp) in a.data.iter() {
+                if let Some(b_comp) = b.data.get(entity) {
+                    if let Some(c_comp) = c.data.get(entity) {
+                        f(*entity, a_comp, b_comp, c_comp);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -188,11 +230,16 @@ impl Resources {
 }
 
 pub fn render_quads(world: &World, canvas: &Canvas) {
-    for (_, quad) in world.query::<Quad>() {
-        let paint = Paint::new(
-            quad.color,
-            None
-        );
+    let mut q_view = world.view_mut::<Quad>();
+    let t_view = world.view::<Transform>();
+
+    for (entity, quad) in q_view.iter_mut() {
+        canvas.save();
+        if let Some(transform) = t_view.storage.data.get(&entity) {
+            canvas.concat(&transform.local_to_parent);
+        }
+        let paint = Paint::new(quad.color, None);
         canvas.draw_rect(quad.rect, &paint);
+        canvas.restore();
     }
 }
